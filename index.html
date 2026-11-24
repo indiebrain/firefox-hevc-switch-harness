@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HLS Format Switch Test</title>
+<style>
+  :root { --bg: #fff; --fg: #1b1b1f; --muted: #666; --line: #ddd; --bad: #b3261e; --good: #1e7b34; --pick: #e8f0fe; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #141416; --fg: #e8e8ea; --muted: #9a9aa0; --line: #333; --bad: #ff8a80; --good: #7bd88f; --pick: #233150; } }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; display: grid; gap: 16px; }
+  h1 { font-size: 20px; margin: 0; }
+  p { margin: 0; color: var(--muted); }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  video { width: 100%; max-height: 52vh; background: #000; }
+  button, select { font: inherit; padding: 4px 10px; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 3px 8px; border-bottom: 1px solid var(--line); }
+  tr.current { background: var(--pick); }
+  #status { font-family: ui-monospace, monospace; }
+  #log { font: 12px/1.4 ui-monospace, monospace; white-space: pre-wrap; border: 1px solid var(--line); padding: 8px; max-height: 40vh; overflow: auto; margin: 0; }
+  .bad { color: var(--bad); font-weight: 600; }
+  .good { color: var(--good); }
+  .scroll { overflow-x: auto; }
+</style>
+</head>
+<body>
+<main>
+  <h1>HLS format switch test</h1>
+  <p>Plays an HLS stream through hls.js and forces quality switches between video formats (H.264, HEVC, VP9, AV1). It logs hls.js errors and flags the moment the picture stops while playback time keeps moving.</p>
+
+  <div class="row">
+    <label>hls.js
+      <select id="hlsSource">
+        <option value="1.4.8">1.4.8 from jsDelivr</option>
+        <option value="1.7.4">1.7.4 from jsDelivr</option>
+      </select>
+    </label>
+    <label>Playlist
+      <select id="only">
+        <option value="">All formats, as the stream serves it</option>
+        <option value="avc1">H.264 only</option>
+        <option value="hvc1">HEVC only</option>
+      </select>
+    </label>
+    <button id="reload">Reload with these settings</button>
+  </div>
+
+  <video id="video" controls playsinline loop></video>
+
+  <div class="row">
+    <button id="auto">Quality: Auto</button>
+    <button id="cycle">Start format cycle</button>
+    <button id="copy">Copy log</button>
+    <span id="status"></span>
+  </div>
+  <p>Format cycle: every 6 seconds it asks hls.js to move to the next format at the same resolution, the way Auto can when the connection speed changes. Press play first.</p>
+
+  <div class="scroll">
+    <table>
+      <thead><tr><th>#</th><th>Format</th><th>Codec</th><th>Size</th><th>Bitrate</th><th>Browser says playable</th><th>Switch</th></tr></thead>
+      <tbody id="levels"></tbody>
+    </table>
+  </div>
+
+  <pre id="log"></pre>
+</main>
+
+<script>
+  const params = new URLSearchParams(location.search);
+  const hlsSource = params.get('hls') || '1.4.8';
+  const only = params.get('only') || '';
+  const SCRIPT_URLS = {
+    '1.4.8': 'https://cdn.jsdelivr.net/npm/hls.js@1.4.8/dist/hls.min.js',
+    '1.7.4': 'https://cdn.jsdelivr.net/npm/hls.js@1.7.4/dist/hls.min.js',
+  };
+  const FORMAT_NAMES = { avc1: 'H.264', hvc1: 'HEVC', hev1: 'HEVC', vp09: 'VP9', av01: 'AV1' };
+  const PICTURE_LOST_AFTER_MS = 1500;
+
+  const $ = (id) => document.getElementById(id);
+  const video = $('video');
+  const started = performance.now();
+  let hls;
+
+  $('hlsSource').value = hlsSource;
+  $('only').value = only;
+  $('reload').onclick = () => {
+    const next = new URLSearchParams({ hls: $('hlsSource').value });
+    if ($('only').value) next.set('only', $('only').value);
+    location.search = next.toString();
+  };
+  $('copy').onclick = () => navigator.clipboard.writeText($('log').textContent);
+
+  function log(message, kind) {
+    const seconds = ((performance.now() - started) / 1000).toFixed(1).padStart(6);
+    const at = video.currentTime.toFixed(1).padStart(5);
+    const line = document.createElement('span');
+    if (kind) line.className = kind;
+    line.textContent = `${seconds}s  video ${at}s  ${message}\n`;
+    $('log').append(line);
+    $('log').scrollTop = $('log').scrollHeight;
+  }
+
+  const family = (codec) => (codec || '').slice(0, 4);
+  const formatName = (codec) => FORMAT_NAMES[family(codec)] || family(codec) || '?';
+  const describe = (index) => {
+    const level = hls.levels[index];
+    return level ? `#${index} ${formatName(level.videoCodec)} ${level.height}p (${level.videoCodec})` : `#${index}`;
+  };
+
+  // The picture counts as lost when playback time advances but the browser
+  // presents no new video frame for PICTURE_LOST_AFTER_MS.
+  let lastFrameAt = performance.now();
+  let lastTime = 0;
+  let pictureLost = false;
+  function watchFrames() {
+    if ('requestVideoFrameCallback' in video) {
+      const onFrame = () => { lastFrameAt = performance.now(); video.requestVideoFrameCallback(onFrame); };
+      video.requestVideoFrameCallback(onFrame);
+    } else {
+      let lastCount = 0;
+      setInterval(() => {
+        const count = video.getVideoPlaybackQuality().totalVideoFrames;
+        if (count !== lastCount) { lastCount = count; lastFrameAt = performance.now(); }
+      }, 100);
+    }
+    setInterval(() => {
+      const advancing = !video.paused && video.currentTime !== lastTime;
+      lastTime = video.currentTime;
+      const stale = performance.now() - lastFrameAt > PICTURE_LOST_AFTER_MS;
+      if (advancing && stale && !pictureLost) {
+        pictureLost = true;
+        log(`PICTURE LOST: time keeps moving, no new video frame for ${PICTURE_LOST_AFTER_MS} ms. Playing ${describe(hls.currentLevel)}`, 'bad');
+      } else if (pictureLost && !stale) {
+        pictureLost = false;
+        log('Picture back', 'good');
+      }
+      const quality = video.getVideoPlaybackQuality();
+      $('status').textContent = `frames ${quality.totalVideoFrames}, dropped ${quality.droppedVideoFrames}` +
+        (hls && hls.currentLevel >= 0 ? `, playing ${describe(hls.currentLevel)}` : '');
+    }, 250);
+  }
+
+  function renderLevels() {
+    $('levels').replaceChildren(...hls.levels.map((level, index) => {
+      const row = document.createElement('tr');
+      row.dataset.index = index;
+      const codecs = `video/mp4; codecs="${level.videoCodec}"`;
+      const playable = window.MediaSource && MediaSource.isTypeSupported(codecs);
+      const cells = [index, formatName(level.videoCodec), level.videoCodec, `${level.width}x${level.height}`,
+        `${Math.round(level.bitrate / 1000)} kbps`, playable ? 'yes' : 'no'];
+      cells.forEach((text) => { const cell = document.createElement('td'); cell.textContent = text; row.append(cell); });
+      const actions = document.createElement('td');
+      const smooth = document.createElement('button');
+      smooth.textContent = 'Next chunk';
+      smooth.title = 'hls.nextLevel: switch at the next chunk boundary, the way Auto does';
+      smooth.onclick = () => { log(`Requested smooth switch to ${describe(index)}`); hls.nextLevel = index; };
+      const now = document.createElement('button');
+      now.textContent = 'Now';
+      now.title = 'hls.currentLevel: drop the buffer and switch immediately';
+      now.onclick = () => { log(`Requested immediate switch to ${describe(index)}`); hls.currentLevel = index; };
+      actions.append(smooth, ' ', now);
+      row.append(actions);
+      return row;
+    }));
+  }
+
+  function highlight(index) {
+    document.querySelectorAll('#levels tr').forEach((row) => row.classList.toggle('current', Number(row.dataset.index) === index));
+  }
+
+  // Picks, at the same resolution, the level of the next format family. It
+  // steps from the level it last requested, because a smooth switch shows up
+  // in hls.currentLevel only once the next chunk plays.
+  let cycleTimer = null;
+  let cycleTarget = null;
+  function cycleOnce() {
+    const current = hls.levels[cycleTarget ?? Math.max(hls.currentLevel, 0)];
+    const sameHeight = hls.levels.map((level, index) => ({ level, index })).filter(({ level }) => level.height === current.height);
+    const families = [...new Set(sameHeight.map(({ level }) => family(level.videoCodec)))];
+    if (families.length < 2) { log('Only one format at this resolution, nothing to cycle'); return; }
+    const nextFamily = families[(families.indexOf(family(current.videoCodec)) + 1) % families.length];
+    const target = sameHeight.find(({ level }) => family(level.videoCodec) === nextFamily).index;
+    log(`Cycle: smooth switch to ${describe(target)}`);
+    cycleTarget = target;
+    hls.nextLevel = target;
+  }
+  $('cycle').onclick = () => {
+    if (cycleTimer) {
+      clearInterval(cycleTimer); cycleTimer = null; cycleTarget = null; $('cycle').textContent = 'Start format cycle'; log('Format cycle stopped');
+    } else {
+      cycleTimer = setInterval(cycleOnce, 6000); $('cycle').textContent = 'Stop format cycle'; log('Format cycle started'); cycleOnce();
+    }
+  };
+  $('auto').onclick = () => { hls.currentLevel = -1; hls.nextLevel = -1; log('Quality set to Auto'); };
+
+  function start() {
+    log(`Browser: ${navigator.userAgent}`);
+    log(`hls.js ${Hls.version}, playlist: ${only ? only + ' only' : 'all formats'}`);
+    if (!Hls.isSupported()) { log('hls.js reports Media Source Extensions unsupported in this browser', 'bad'); return; }
+
+    hls = new Hls();
+    const E = Hls.Events;
+    hls.on(E.MANIFEST_PARSED, (_, data) => { log(`Playlist parsed: ${data.levels.length} versions`); renderLevels(); });
+    hls.on(E.LEVEL_SWITCHING, (_, data) => log(`Switching to ${describe(data.level)}`));
+    hls.on(E.LEVEL_SWITCHED, (_, data) => { log(`Switched to ${describe(data.level)}`); highlight(data.level); });
+    hls.on(E.BUFFER_CODECS, (_, data) => log(`Buffer codecs: video ${data.video ? data.video.codec || data.video.levelCodec : 'none'}, audio ${data.audio ? data.audio.codec || data.audio.levelCodec : 'none'}`));
+    let playingLevel = null;
+    hls.on(E.FRAG_CHANGED, (_, data) => {
+      if (data.frag.type === 'main' && data.frag.level !== playingLevel) {
+        playingLevel = data.frag.level;
+        log(`On screen now: ${describe(playingLevel)} (chunk ${data.frag.sn})`);
+      }
+    });
+    hls.on(E.ERROR, (_, data) => {
+      const detail = [data.reason, data.error && data.error.message, data.mimeType, data.sourceBufferName].filter(Boolean).join(' | ');
+      log(`hls.js error: ${data.type} / ${data.details}, fatal=${data.fatal}${detail ? ' | ' + detail : ''}`, data.fatal ? 'bad' : undefined);
+    });
+
+    ['play', 'playing', 'pause', 'waiting', 'stalled', 'seeking', 'ended', 'emptied'].forEach((name) =>
+      video.addEventListener(name, () => log(`<video> ${name}`)));
+    video.addEventListener('error', () => log(`<video> error: code ${video.error.code} ${video.error.message}`, 'bad'));
+
+    hls.loadSource(`/video/playlist.m3u8${only ? '?only=' + only : ''}`);
+    hls.attachMedia(video);
+    watchFrames();
+  }
+
+  const script = document.createElement('script');
+  script.src = SCRIPT_URLS[hlsSource] || SCRIPT_URLS['1.4.8'];
+  script.onload = start;
+  script.onerror = () => log(`Could not load hls.js from ${script.src}`, 'bad');
+  document.head.append(script);
+</script>
+</body>
+</html>
